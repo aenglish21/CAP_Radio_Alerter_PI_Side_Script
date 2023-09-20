@@ -1,53 +1,62 @@
 import os
+import time
 import pyaudio
 import numpy as np
-import pushover
-import time
+from pushover import Client
 import json
 
-# Default configuration
-DEFAULT_CONFIG = {
-    "PUSHOVER_TOKEN": "",
-    "PUSHOVER_USER_KEY": "",
-    "DETECT_FREQUENCY": 440,
-    "FREQUENCY_THRESHOLD": 10,
-    "NOTIFICATION_DELAY": 60
-}
-
-CONFIG_FILE = "config.json"
-
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
+# Function to load configuration from a JSON file or generate default
+def load_or_generate_config():
+    config_file = "config.json"
+    if os.path.exists(config_file):
+        with open(config_file, "r") as f:
+            config = json.load(f)
     else:
-        return DEFAULT_CONFIG
+        # Default configuration
+        config = {
+            "PUSHOVER_TOKEN": "",
+            "PUSHOVER_USER_KEY": "",
+            "DETECT_FREQUENCY": 440,
+            "FREQUENCY_THRESHOLD": 10,
+            "NOTIFICATION_DELAY": 60
+        }
 
-def save_config(config):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=4)
+        # Generate a config.json file with default values
+        with open(config_file, "w") as f:
+            json.dump(config, f, indent=4)
 
-def setup_config():
-    config = load_config()
-    for key, value in DEFAULT_CONFIG.items():
-        if key not in config:
-            config[key] = input(f"Enter {key.replace('_', ' ').title()} [{value}]: ") or value
-    save_config(config)
     return config
 
-def detect_song_frequency(data):
-    # ... (same as previous code)
+# Initialize Pushover client
+def init_pushover_client(config):
+    pushover_user_key = config["PUSHOVER_USER_KEY"]
+    pushover_api_token = config["PUSHOVER_TOKEN"]
+    pushover_client = Client(pushover_user_key, api_token=pushover_api_token)
+    return pushover_client
 
+# Function to detect the frequency of the audio data
+def detect_song_frequency(audio_data, sample_rate):
+    # Apply FFT to the audio data
+    fft_data = np.fft.fft(audio_data)
+
+    # Find the index of the maximum amplitude in the FFT data
+    max_index = np.argmax(np.abs(fft_data))
+
+    # Calculate the corresponding frequency
+    frequency = max_index * sample_rate / len(audio_data)
+
+    return frequency
+
+# Function to send a notification using Pushover
 def send_notification(pushover_client):
-    pushover_client.send_message("Detected the specified song!", title="Song Detection")
+    pushover_client.send_message("Data Terminal Has A New Message!", title="CAP Radio Message Alert")
+
+# Rest of your code remains the same
 
 def main():
-    config = setup_config()
+    config = load_or_generate_config()
+    pushover_client = init_pushover_client(config)
 
-    # Initialize Pushover client
-    pushover_client = pushover.Client(config["PUSHOVER_USER_KEY"], api_token=config["PUSHOVER_TOKEN"])
-
-    # Initialize audio stream
     audio = pyaudio.PyAudio()
     stream = audio.open(format=pyaudio.paInt16, channels=1, rate=44100, input=True, frames_per_buffer=1024)
 
@@ -56,7 +65,8 @@ def main():
     try:
         while True:
             data = stream.read(1024)
-            detected_frequency = detect_song_frequency(data)
+            audio_data = np.frombuffer(data, dtype=np.int16)
+            detected_frequency = detect_song_frequency(audio_data, 44100)
 
             if abs(detected_frequency - config["DETECT_FREQUENCY"]) < config["FREQUENCY_THRESHOLD"]:
                 send_notification(pushover_client)
@@ -69,7 +79,4 @@ def main():
     audio.terminate()
 
 if __name__ == "__main__":
-    if not os.path.exists(CONFIG_FILE):
-        print("Config file not found. Creating a new one...")
-        setup_config()
     main()
