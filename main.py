@@ -1,82 +1,129 @@
-import os
-import time
 import pyaudio
+import pushover
 import numpy as np
-from pushover import Client
 import json
+import click
+import time
+import logging
+import sys
 
-# Function to load configuration from a JSON file or generate default
-def load_or_generate_config():
-    config_file = "config.json"
-    if os.path.exists(config_file):
-        with open(config_file, "r") as f:
-            config = json.load(f)
-    else:
-        # Default configuration
-        config = {
-            "PUSHOVER_TOKEN": "",
-            "PUSHOVER_USER_KEY": "",
-            "DETECT_FREQUENCY": 440,
-            "FREQUENCY_THRESHOLD": 10,
-            "NOTIFICATION_DELAY": 60
-        }
+# Configure logging
+logging.basicConfig(filename='audio_detection.log', level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-        # Generate a config.json file with default values
-        with open(config_file, "w") as f:
-            json.dump(config, f, indent=4)
+# Add a stream handler to display log messages in the console
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+logging.getLogger('').addHandler(console_handler)
 
-    return config
+# Load configuration from config.json
+with open('config.json') as config_file:
+    config = json.load(config_file)
 
-# Initialize Pushover client
-def init_pushover_client(config):
-    pushover_user_key = config["PUSHOVER_USER_KEY"]
-    pushover_api_token = config["PUSHOVER_TOKEN"]
-    pushover_client = Client(pushover_user_key, api_token=pushover_api_token)
-    return pushover_client
+# Extract Pushover API token and user key from the config
+PUSHOVER_API_TOKEN = config.get('PUSHOVER_TOKEN', 'YOUR_DEFAULT_API_TOKEN')
+PUSHOVER_USER_KEY = config.get('PUSHOVER_USER_KEY', 'YOUR_DEFAULT_USER_KEY')
 
-# Function to detect the frequency of the audio data
-def detect_song_frequency(audio_data, sample_rate):
-    # Apply FFT to the audio data
-    fft_data = np.fft.fft(audio_data)
+# Extract and set the selected input device from the config or None
+selected_device = config.get('selected_input_device', None)
 
-    # Find the index of the maximum amplitude in the FFT data
-    max_index = np.argmax(np.abs(fft_data))
+# Define sound detection parameters
+SOUND_THRESHOLD = 60.01  # Adjust this threshold as needed
+ALERT_MESSAGE = "CAP Radio Alert!"
+ALERT_TITLE = "Alert Detected"
 
-    # Calculate the corresponding frequency
-    frequency = max_index * sample_rate / len(audio_data)
+# Initialize the Pushover client
+pushover_client = pushover.Client(PUSHOVER_USER_KEY, api_token=PUSHOVER_API_TOKEN)
 
-    return frequency
+# Initialize PyAudio
+audio = pyaudio.PyAudio()
 
-# Function to send a notification using Pushover
-def send_notification(pushover_client):
-    pushover_client.send_message("Data Terminal Has A New Message!", title="CAP Radio Message Alert")
 
-# Rest of your code remains the same
+# Function to list available audio input devices
+def list_input_devices():
+    input_devices = {}
+    for i in range(audio.get_device_count()):
+        device_info = audio.get_device_info_by_index(i)
+        if device_info['maxInputChannels'] > 0:
+            input_devices[i] = device_info['name']
+    return input_devices
 
-def main():
-    config = load_or_generate_config()
-    pushover_client = init_pushover_client(config)
 
-    audio = pyaudio.PyAudio()
-    stream = audio.open(format=pyaudio.paInt16, channels=1, rate=44100, input=True, frames_per_buffer=1024)
+# Function to select the audio input device interactively or use a default device
+def select_input_device():
+    input_devices = list_input_devices()
 
-    print("Listening for song...")
+    if not input_devices:
+        logging.error("No input devices found. Using the default input device.")
+        print("No input devices found. Using the default input device.")
+        return None
 
+    logging.info("Available input devices:")
+    for index, name in input_devices.items():
+        logging.info(f"{index}: {name}")
+
+    # Initialize selected_device to None
+    selected_device = None
+
+    if config.get('selected_input_device'):
+        logging.info(f"Using previously selected device: {config['selected_input_device']}")
+        selected_device = config['selected_input_device']
+
+    if selected_device is None:
+        selected_device = click.prompt(
+            "Select an input device (enter the corresponding index) or press Enter for the default: ", type=int,
+            default=None)
+
+    if selected_device not in input_devices:
+        logging.error("Invalid selection. Using the default input device.")
+        print("Invalid selection. Using the default input device.")
+        return None
+
+    # Save the selected device to the config file for future use
+    config['selected_input_device'] = selected_device
+    with open('config.json', 'w') as config_file:
+        json.dump(config, config_file)
+
+    return selected_device
+
+
+selected_device = select_input_device()
+
+# Initialize a variable to keep track of the last alert time
+last_alert_time = 0
+
+# Open the audio input stream using the selected input device or the default device
+stream = audio.open(format=pyaudio.paInt16, channels=1, rate=44100, input=True,
+                    input_device_index=selected_device, frames_per_buffer=1024)
+
+logging.info("Listening for sound...")
+
+while True:
     try:
-        while True:
-            data = stream.read(1024)
-            audio_data = np.frombuffer(data, dtype=np.int16)
-            detected_frequency = detect_song_frequency(audio_data, 44100)
+        data = stream.read(1024, exception_on_overflow=False)  # Set exception_on_overflow to False
+        audio_data = np.frombuffer(data, dtype=np.int16)
 
-            if abs(detected_frequency - config["DETECT_FREQUENCY"]) < config["FREQUENCY_THRESHOLD"]:
-                send_notification(pushover_client)
-                time.sleep(config["NOTIFICATION_DELAY"])
+        # Check if the audio data contains NaN or out-of-range values
+        if not np.isnan(audio_data).any() and (np.abs(audio_data) < 32768).all():
+            try:
+                # Calculate the root mean square (RMS) value
+                rms = np.sqrt(np.mean(audio_data ** 2))
+            except RuntimeWarning as rw:
+                logging.warning(f"RuntimeWarning: {rw}")
+                rms = 0  # Set to 0 to avoid invalid value in case of warnings
+
+            # Check if enough time has passed since the last alert
+            current_time = time.time()
+            if current_time - last_alert_time >= 60:  # 60 seconds (1 minute)
+                if rms > SOUND_THRESHOLD:
+                    logging.info("Alert detected!")
+                    pushover_client.send_message(ALERT_MESSAGE, title=ALERT_TITLE)
+                    last_alert_time = current_time  # Update the last alert time
     except KeyboardInterrupt:
-        pass
+        break
 
-    stream.stop_stream()
-    stream.close()
-    audio.terminate()
-
-if __name__ == "__main__":
-    main()
+# Cleanup
+stream.stop_stream()
+stream.close()
+audio.terminate()
+sys.exit(0)
